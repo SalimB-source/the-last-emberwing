@@ -3,7 +3,7 @@
 #include "EmberwingCharacter.h"
 #include "EmberwingPlayerController.h"
 #include "EmberwingPrototypeWorld.h"
-#include "Engine/PlayerStart.h"
+#include "GameFramework/PlayerStart.h"
 #include "Kismet/GameplayStatics.h"
 
 AEmberwingGameMode::AEmberwingGameMode()

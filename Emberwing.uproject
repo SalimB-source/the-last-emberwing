@@ -1,0 +1,17 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.4",
+  "Category": "Games",
+  "Description": "The Last Emberwing - a dark fairy-tale 3D platformer.",
+  "Modules": [
+    {
+      "Name": "Emberwing",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "TargetPlatforms": [
+    "Android",
+    "Windows"
+  ]
+}

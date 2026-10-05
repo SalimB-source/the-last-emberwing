@@ -37,6 +37,10 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
     UCameraComponent* FollowCamera;
 
+    /** Correctif ecran noir : garantit que la camera reste active meme si PlayerStart mal place */
+    UFUNCTION(BlueprintCallable, Category = "Camera")
+    void EnsureCameraActive();
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement")
     float GlideGravityScale = 0.28f;
 

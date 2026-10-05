@@ -1,21 +1,23 @@
 #include "EmberwingGameMode.h"
 
+#include "Camera/CameraComponent.h"
 #include "EmberwingCharacter.h"
+#include "EmberwingLightingRig.h"
 #include "EmberwingPlayerController.h"
 #include "EmberwingPrototypeWorld.h"
-#include "Engine/DirectionalLight.h"
-#include "Engine/ExponentialHeightFog.h"
-#include "Engine/PostProcessVolume.h"
-#include "Engine/SkyLight.h"
-#include "Engine/SkyAtmosphere.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
 #include "GameFramework/PlayerStart.h"
 #include "Kismet/GameplayStatics.h"
 
 AEmberwingGameMode::AEmberwingGameMode()
 {
+    // Tick volontaire : sert uniquement de garde-fou camera/pawn (voir Tick()).
+    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bStartWithTickEnabled = true;
+
     DefaultPawnClass = AEmberwingCharacter::StaticClass();
     PlayerControllerClass = AEmberwingPlayerController::StaticClass();
-    // Securite : si le Blueprint n'est pas encore compile, on garde la classe C++ par defaut
     bStartPlayersAsSpectators = false;
     bDelayedStart = false;
 }
@@ -24,46 +26,97 @@ void AEmberwingGameMode::InitGame(const FString& MapName, const FString& Options
 {
     Super::InitGame(MapName, Options, ErrorMessage);
 
-    // InitGame est appele avant StartPlay : on peut deja garantir que le monde prototype existe
-    // afin que le PlayerStart soit au-dessus d'une plateforme valide.
+    // Lumieres AVANT la geometrie : le rig detruit les lumieres Statique heritees du niveau
+    // (invisibles pour Lumen sans "Build Lighting") et pose son post-process. Les meshes
+    // crees ensuite sont eclaires par des sources Movable, donc lisibles des la 1re frame.
+    if (bInstallLighting)
+    {
+        AEmberwingLightingRig::EnsureLightingRig(this);
+    }
+
     EnsurePrototypeWorldAndPlayerStart();
+
+    UE_LOG(LogTemp, Display, TEXT("[Emberwing] InitGame sur '%s' - arene + eclairage en place"), *MapName);
 }
 
 void AEmberwingGameMode::StartPlay()
 {
-    // Garantit que l'eclairage de secours existe avant que la camera ne s'active (evite frame noir)
-    EnsureWorldLighting();
     EnsurePrototypeWorldAndPlayerStart();
 
     Super::StartPlay();
 
-    // Securite post-Super : si aucun Pawn n'a ete spawne (PlayerStart manquant au moment du RestartPlayer)
-    if (UWorld* World = GetWorld())
+    UWorld* World = GetWorld();
+    if (!World)
     {
-        for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+        return;
+    }
+
+    for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+    {
+        APlayerController* PC = It->Get();
+        if (!PC)
         {
-            APlayerController* PC = It->Get();
-            if (PC && PC->GetPawn() == nullptr)
+            continue;
+        }
+
+        if (!PC->GetPawn())
+        {
+            // Aucun pawn : pas de ViewTarget valide -> ecran noir. On force un restart, puis
+            // en dernier recours un spawn direct au debut de la route.
+            RestartPlayer(PC);
+
+            if (!PC->GetPawn())
             {
-                RestartPlayer(PC);
-                // Fallback : teleport direct si RestartPlayer echoue
-                if (PC->GetPawn() == nullptr)
+                FActorSpawnParameters SpawnParams;
+                SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+                const FVector Fallback = AEmberwingPrototypeWorld::GetRouteStartLocation();
+
+                if (APawn* NewPawn = World->SpawnActor<APawn>(DefaultPawnClass, Fallback, FRotator::ZeroRotator, SpawnParams))
                 {
-                    FActorSpawnParameters SpawnParams;
-                    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-                    FVector SafeLoc = GetSafePlayerStartLocation();
-                    APawn* NewPawn = World->SpawnActor<APawn>(DefaultPawnClass, SafeLoc, FRotator::ZeroRotator, SpawnParams);
-                    if (NewPawn)
-                    {
-                        PC->Possess(NewPawn);
-                    }
+                    PC->Possess(NewPawn);
                 }
             }
-            // Force ViewTarget apres spawn pour eviter camera noire bloquee sur WorldSettings
-            if (PC && PC->GetPawn())
-            {
-                PC->SetViewTargetWithBlend(PC->GetPawn(), 0.0f);
-            }
+        }
+
+        if (APawn* Pawn = PC->GetPawn())
+        {
+            PC->SetViewTargetWithBlend(Pawn, 0.0f);
+        }
+    }
+}
+
+void AEmberwingGameMode::Tick(float DeltaSeconds)
+{
+    Super::Tick(DeltaSeconds);
+
+    // Garde-fou : pendant les premieres secondes, on recolle la camera si rien n'est active
+    // (cas d'un PlayerStart mal place qui laisserait le view target sur le WorldSettings).
+    if (CameraGuardTime > 5.0f)
+    {
+        return;
+    }
+
+    CameraGuardTime += DeltaSeconds;
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+    {
+        APlayerController* PC = It->Get();
+        APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+        if (!PC || !Pawn)
+        {
+            continue;
+        }
+
+        const bool bHasCamera = (Pawn->FindComponentByClass<UCameraComponent>() != nullptr);
+        if (!PC->PlayerCameraManager && bHasCamera)
+        {
+            PC->SetViewTargetWithBlend(Pawn, 0.0f);
         }
     }
 }
@@ -74,28 +127,53 @@ AActor* AEmberwingGameMode::ChoosePlayerStart_Implementation(AController* Player
     {
         TArray<AActor*> Starts;
         UGameplayStatics::GetAllActorsOfClass(World, APlayerStart::StaticClass(), Starts);
-        if (Starts.Num() > 0)
+
+        AActor* Best = nullptr;
+        float BestDistance = TNumericLimits<float>::Max();
+        const FVector Reference = AEmberwingPrototypeWorld::GetRouteStartLocation();
+
+        for (AActor* Start : Starts)
         {
-            // Prefere le PlayerStart le plus haut / le plus proche du centre de l'arene
-            AActor* Best = Starts[0];
-            float BestScore = -FLT_MAX;
-            FVector ArenaCenter = FVector(700.0f, 0.0f, 0.0f);
-            for (AActor* S : Starts)
+            if (!Start)
             {
-                if (!S) continue;
-                float DistScore = -FVector::Dist2D(S->GetActorLocation(), ArenaCenter);
-                float HeightScore = S->GetActorLocation().Z * 0.5f;
-                float Score = DistScore + HeightScore;
-                if (Score > BestScore)
-                {
-                    BestScore = Score;
-                    Best = S;
-                }
+                continue;
             }
+
+            // On veut le depart de la route, pas le point le plus haut : un spawn au-dessus
+            // de l'autel final enverrait le joueur dans le vide.
+            const float Distance = FVector::Dist(Start->GetActorLocation(), Reference);
+            if (Distance < BestDistance)
+            {
+                BestDistance = Distance;
+                Best = Start;
+            }
+        }
+
+        if (Best)
+        {
             return Best;
         }
     }
+
     return Super::ChoosePlayerStart_Implementation(Player);
+}
+
+bool AEmberwingGameMode::HasBlockingGroundBelow(const FVector& Location) const
+{
+    const UWorld* World = GetWorld();
+    if (!World)
+    {
+        return false;
+    }
+
+    FHitResult Hit;
+    FCollisionQueryParams Params;
+    Params.bTraceComplex = false;
+
+    const FVector Start = Location + FVector(0.0f, 0.0f, 200.0f);
+    const FVector End = Location - FVector(0.0f, 0.0f, 900.0f);
+
+    return World->LineTraceSingleByChannel(Hit, Start, End, ECC_WorldStatic, Params);
 }
 
 void AEmberwingGameMode::EnsurePrototypeWorldAndPlayerStart()
@@ -109,154 +187,54 @@ void AEmberwingGameMode::EnsurePrototypeWorldAndPlayerStart()
     FActorSpawnParameters SpawnParams;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
-    // 1) PrototypeWorld : ne le creer qu'une fois
-    TArray<AActor*> ExistingWorlds;
-    UGameplayStatics::GetAllActorsOfClass(World, AEmberwingPrototypeWorld::StaticClass(), ExistingWorlds);
-    if (ExistingWorlds.Num() == 0)
+    // 1) L'arene, une seule fois. Elle se construit dans son PostInitializeComponents.
+    if (bBuildPrototypeWorld)
     {
-        World->SpawnActor<AEmberwingPrototypeWorld>(AEmberwingPrototypeWorld::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+        TArray<AActor*> ExistingWorlds;
+        UGameplayStatics::GetAllActorsOfClass(World, AEmberwingPrototypeWorld::StaticClass(), ExistingWorlds);
+        if (ExistingWorlds.Num() == 0)
+        {
+            World->SpawnActor<AEmberwingPrototypeWorld>(AEmberwingPrototypeWorld::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+        }
     }
 
-    // 2) PlayerStart : place SUR la grande plateforme initiale, pas a 0,0,80 qui etait au bord / sous le sol
+    // 2) PlayerStart : pose au debut de la route, ou corrige s'il est sous le sol.
+    const FVector RouteStart = AEmberwingPrototypeWorld::GetRouteStartLocation();
+
     TArray<AActor*> ExistingStarts;
     UGameplayStatics::GetAllActorsOfClass(World, APlayerStart::StaticClass(), ExistingStarts);
+
     if (ExistingStarts.Num() == 0)
     {
-        FVector SafeLoc = GetSafePlayerStartLocation();
-        FRotator SafeRot = FRotator(0.0f, 0.0f, 0.0f);
-        APlayerStart* NewStart = World->SpawnActor<APlayerStart>(APlayerStart::StaticClass(), SafeLoc, SafeRot, SpawnParams);
+        APlayerStart* NewStart = World->SpawnActor<APlayerStart>(APlayerStart::StaticClass(), RouteStart, FRotator(0.0f, 0.0f, 0.0f), SpawnParams);
         if (NewStart)
         {
-            // Evite que la capsule spawn a moitie dans le sol : on ajoute un decalage et on verifie le sol
-            NewStart->SetActorLocation(SafeLoc);
+            NewStart->SetActorLocation(RouteStart);
         }
     }
     else
     {
-        // Corrige les PlayerStart existants mal places (ex : map vide avec start a 0,0,0 sous le sol)
-        for (AActor* S : ExistingStarts)
+        for (AActor* Start : ExistingStarts)
         {
-            if (!S) continue;
-            FVector Loc = S->GetActorLocation();
-            if (Loc.Z < 0.0f || FVector::Dist2D(Loc, FVector(700,0,0)) > 4000.0f)
+            if (!Start)
             {
-                S->SetActorLocation(GetSafePlayerStartLocation());
+                continue;
+            }
+
+            const FVector Location = Start->GetActorLocation();
+            const bool bBelowGround = !HasBlockingGroundBelow(Location);
+
+            if (Location.Z < -400.0f || FVector::Dist2D(Location, FVector(1700.0f, 0.0f, 0.0f)) > 9000.0f || bBelowGround)
+            {
+                Start->SetActorLocation(RouteStart);
             }
         }
     }
-}
 
-FVector AEmberwingGameMode::GetSafePlayerStartLocation() const
-{
-    // Centre de la premiere plateforme generee dans PrototypeWorld : (700,0,-100) avec echelle 14,8,1
-    // Top de la plateforme = -100 + 50 (= demi-cube * scale Z 1) = -50. On spawn a -50 + 120 = 70 au dessus.
-    // On ajoute X 700 pour etre bien au centre, pas au bord 0.
-    return FVector(700.0f, 0.0f, 120.0f);
-}
-
-void AEmberwingGameMode::EnsureWorldLighting()
-{
-    UWorld* World = GetWorld();
-    if (!World)
+    if (!bBuildPrototypeWorld)
     {
         return;
     }
 
-    FActorSpawnParameters SpawnParams;
-    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-
-    // DirectionalLight
-    TArray<AActor*> DirLights;
-    UGameplayStatics::GetAllActorsOfClass(World, ADirectionalLight::StaticClass(), DirLights);
-    if (DirLights.Num() == 0)
-    {
-        ADirectionalLight* DL = World->SpawnActor<ADirectionalLight>(ADirectionalLight::StaticClass(), FVector::ZeroVector, FRotator(-45.0f, 35.0f, 0.0f), SpawnParams);
-        if (DL && DL->GetLightComponent())
-        {
-            DL->GetLightComponent()->SetMobility(EComponentMobility::Movable);
-            DL->GetLightComponent()->SetIntensity(10.0f);
-            DL->GetLightComponent()->SetLightColor(FLinearColor(1.0f, 0.98f, 0.92f));
-            DL->GetLightComponent()->SetCastShadows(true);
-            DL->SetActorRotation(FRotator(-45.0f, 35.0f, 0.0f));
-        }
-    }
-    else
-    {
-        for (AActor* A : DirLights)
-        {
-            if (ADirectionalLight* DL = Cast<ADirectionalLight>(A))
-            {
-                if (DL->GetLightComponent() && DL->GetLightComponent()->Intensity < 1.0f)
-                {
-                    DL->GetLightComponent()->SetIntensity(7.5f);
-                }
-            }
-        }
-    }
-
-    // SkyLight (capture temps reel pour eviter noir sans cubemap bake)
-    TArray<AActor*> SkyLights;
-    UGameplayStatics::GetAllActorsOfClass(World, ASkyLight::StaticClass(), SkyLights);
-    if (SkyLights.Num() == 0)
-    {
-        ASkyLight* SL = World->SpawnActor<ASkyLight>(ASkyLight::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
-        if (SL && SL->GetLightComponent())
-        {
-            SL->GetLightComponent()->SetMobility(EComponentMobility::Movable);
-            SL->GetLightComponent()->SetIntensity(1.2f);
-            SL->GetLightComponent()->bRealTimeCapture = true;
-        }
-    }
-
-    // SkyAtmosphere + Fog pour que la SkyLight ait une source
-    TArray<AActor*> SkyAtmos;
-    UGameplayStatics::GetAllActorsOfClass(World, ASkyAtmosphere::StaticClass(), SkyAtmos);
-    if (SkyAtmos.Num() == 0)
-    {
-        World->SpawnActor<ASkyAtmosphere>(ASkyAtmosphere::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
-    }
-
-    TArray<AActor*> Fogs;
-    UGameplayStatics::GetAllActorsOfClass(World, AExponentialHeightFog::StaticClass(), Fogs);
-    if (Fogs.Num() == 0)
-    {
-        AExponentialHeightFog* Fog = World->SpawnActor<AExponentialHeightFog>(AExponentialHeightFog::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
-        if (Fog && Fog->GetComponent())
-        {
-            Fog->GetComponent()->FogDensity = 0.015f;
-            Fog->GetComponent()->FogHeightFalloff = 0.2f;
-        }
-    }
-
-    // PostProcessVolume global avec exposition fixe et Lumen lisible
-    TArray<AActor*> PPVs;
-    UGameplayStatics::GetAllActorsOfClass(World, APostProcessVolume::StaticClass(), PPVs);
-    bool bHasUnbound = false;
-    for (AActor* A : PPVs)
-    {
-        if (APostProcessVolume* V = Cast<APostProcessVolume>(A))
-        {
-            if (V->bUnbound) { bHasUnbound = true; break; }
-        }
-    }
-    if (!bHasUnbound)
-    {
-        APostProcessVolume* PPV = World->SpawnActor<APostProcessVolume>(APostProcessVolume::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
-        if (PPV)
-        {
-            PPV->bUnbound = true;
-            PPV->Settings.bOverride_AutoExposureMinBrightness = true;
-            PPV->Settings.bOverride_AutoExposureMaxBrightness = true;
-            PPV->Settings.AutoExposureMinBrightness = 1.0f;
-            PPV->Settings.AutoExposureMaxBrightness = 1.0f;
-            PPV->Settings.bOverride_AutoExposureBias = true;
-            PPV->Settings.AutoExposureBias = 0.0f;
-            PPV->Settings.bOverride_LocalExposureHighlightContrastScale = true;
-            PPV->Settings.bOverride_LocalExposureShadowContrastScale = true;
-            PPV->Settings.bOverride_AmbientCubemapIntensity = true;
-            PPV->Settings.AmbientCubemapIntensity = 0.6f;
-            PPV->Settings.bOverride_BloomIntensity = true;
-            PPV->Settings.BloomIntensity = 0.35f;
-        }
-    }
+    UE_LOG(LogTemp, Display, TEXT("[Emberwing] PlayerStart pose a %s"), *RouteStart.ToString());
 }

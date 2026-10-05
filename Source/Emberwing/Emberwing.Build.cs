@@ -11,7 +11,8 @@ public class Emberwing : ModuleRules
             "Core",
             "CoreUObject",
             "Engine",
-            "InputCore"
+            "InputCore",
+            "EnhancedInput"
         });
     }
 }

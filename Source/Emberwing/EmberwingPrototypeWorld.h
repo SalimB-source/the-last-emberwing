@@ -28,7 +28,12 @@ private:
     UPROPERTY()
     UStaticMesh* SphereMesh;
 
+    UPROPERTY()
+    class UMaterialInterface* GridMaterial;
+
     void AddPlatform(const FVector& Location, const FVector& Scale);
     void AddLantern(const FVector& Location);
     void SpawnEnemy(const FVector& Location);
+    void EnsureWorldLighting();
+    void FixExistingWorldLighting();
 };

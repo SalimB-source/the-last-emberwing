@@ -29,18 +29,40 @@ AEmberwingCharacter::AEmberwingCharacter()
     Movement->BrakingDecelerationWalking = 1800.0f;
     JumpMaxCount = 1;
 
+    // --- Correctif Camera : configuration third-person robuste (UE5.8) ---
     CameraBoom = CreateDefaultSubobject<USpringArmComponent>(TEXT("CameraBoom"));
     CameraBoom->SetupAttachment(RootComponent);
-    CameraBoom->TargetArmLength = 520.0f;
-    CameraBoom->SetRelativeLocation(FVector(0.0f, 0.0f, 80.0f));
-    CameraBoom->SetRelativeRotation(FRotator(-12.0f, 0.0f, 0.0f));
+    // SpringArm decale verticalement pour viser hauteur yeux (evite SetRelativeLocation + rotation combinees qui masquAIENT la vue)
+    CameraBoom->TargetArmLength = 450.0f;
+    CameraBoom->SocketOffset = FVector(0.0f, 0.0f, 75.0f);
+    CameraBoom->TargetOffset = FVector(0.0f, 0.0f, 55.0f);
+    CameraBoom->SetRelativeRotation(FRotator(-15.0f, 0.0f, 0.0f));
     CameraBoom->bUsePawnControlRotation = true;
+    // Garde le collision test mais avec sonde fine pour ne pas coller la camera a 0 si spawn dans collision
     CameraBoom->bDoCollisionTest = true;
+    CameraBoom->ProbeSize = 12.0f;
+    CameraBoom->ProbeChannel = ECC_Camera;
+    CameraBoom->bEnableCameraLag = true;
+    CameraBoom->CameraLagSpeed = 12.0f;
+    CameraBoom->CameraLagMaxDistance = 180.0f;
+    CameraBoom->bEnableCameraRotationLag = true;
+    CameraBoom->CameraRotationLagSpeed = 18.0f;
+    CameraBoom->bInheritPitch = true;
+    CameraBoom->bInheritYaw = true;
+    CameraBoom->bInheritRoll = false;
 
     FollowCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FollowCamera"));
     FollowCamera->SetupAttachment(CameraBoom, USpringArmComponent::SocketName);
     FollowCamera->bUsePawnControlRotation = false;
-    FollowCamera->FieldOfView = 72.0f;
+    FollowCamera->FieldOfView = 82.0f;
+    // Exposition fixe pour prototype : evite ecran noir par AutoExposure sans PostProcessVolume
+    FollowCamera->PostProcessSettings.bOverride_AutoExposureMinBrightness = true;
+    FollowCamera->PostProcessSettings.bOverride_AutoExposureMaxBrightness = true;
+    FollowCamera->PostProcessSettings.AutoExposureMinBrightness = 1.0f;
+    FollowCamera->PostProcessSettings.AutoExposureMaxBrightness = 1.0f;
+    FollowCamera->PostProcessSettings.bOverride_AutoExposureBias = true;
+    FollowCamera->PostProcessSettings.AutoExposureBias = 0.0f;
+    FollowCamera->bAutoActivate = true;
 
     static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMesh(TEXT("/Engine/BasicShapes/Cube.Cube"));
     if (CubeMesh.Succeeded())
@@ -65,6 +87,34 @@ AEmberwingCharacter::AEmberwingCharacter()
 void AEmberwingCharacter::BeginPlay()
 {
     Super::BeginPlay();
+
+    EnsureCameraActive();
+
+    // Oriente la control rotation initiale vers l'avant du personnage pour eviter vue vers le sol
+    if (Controller)
+    {
+        FRotator StartRot = GetActorRotation();
+        StartRot.Pitch = -12.0f;
+        Controller->SetControlRotation(StartRot);
+    }
+}
+
+void AEmberwingCharacter::EnsureCameraActive()
+{
+    if (FollowCamera)
+    {
+        FollowCamera->Activate();
+        // Force PostProcess fixe deja defini dans le constructeur, renforce ici au cas ou world override
+        FollowCamera->PostProcessSettings.bOverride_AutoExposureMinBrightness = true;
+        FollowCamera->PostProcessSettings.bOverride_AutoExposureMaxBrightness = true;
+        FollowCamera->PostProcessSettings.AutoExposureMinBrightness = 1.0f;
+        FollowCamera->PostProcessSettings.AutoExposureMaxBrightness = 1.0f;
+    }
+    if (APlayerController* PC = Cast<APlayerController>(GetController()))
+    {
+        PC->SetViewTargetWithBlend(this, 0.0f);
+        PC->bAutoManageActiveCameraTarget = true;
+    }
 }
 
 void AEmberwingCharacter::Tick(float DeltaSeconds)
